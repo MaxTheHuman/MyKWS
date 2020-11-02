@@ -1,18 +1,15 @@
 import torch
 import torchaudio
-import pandas as pd
-import multiprocessing as mp
 import configparser
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
 
 from model import KWS
+from prepare_big_wav import getBigWaveform
 
 
 use_cuda = torch.cuda.is_available()
 torch.manual_seed(7)
 device = torch.device("cuda" if use_cuda else "cpu")
-# print(device)
 
 config = configparser.ConfigParser()
 config.read('config.ini')
@@ -26,13 +23,45 @@ mel_transform = torchaudio.transforms.MelSpectrogram(
     f_max=8000,
     n_mels=40).to(device)
 
-def apply(model, spectrogram):
+def apply(model, spectrogram, mode):
+    log_softmax = nn.LogSoftmax(dim=1)
     model.eval()
+    window_length = 100
+    shift = 10
+    start_index = 0
+
     with torch.no_grad():
-        output = model(spectrogram, streaming_mode=True)  # (batch, time, n_class)
-        output = log_softmax(output)
-        output = output.transpose(0, 1) # (time, batch, n_class)
-    return output
+
+        end_index = start_index + window_length
+
+        if end_index >= spectrogram.shape[-1] or mode == "check":
+            output, hidden = model(spectrogram, single_input=True)
+            __, predicted = torch.max(output, dim=1)
+
+            print("Key word presence score:", output[0][1].item(), ".\tPredicted class:", predicted.item())
+
+            return output[0][1].item()
+
+        else:
+            outputs = []
+            output, hidden = model(spectrogram[:, :, start_index:end_index], single_input=True)
+            __, predicted = torch.max(output, dim=1)
+            print("Key word presence score:", output[0][1].item(), ".\tPredicted class:", predicted.item())
+            
+            start_index += shift
+            end_index += shift
+
+            while end_index < spectrogram.shape[-1]:
+                output, hidden = model(spectrogram[:, :, start_index:end_index], encoder_hidden=hidden, single_input=True)
+                __, predicted = torch.max(output, dim=1)
+
+                print("Key word presence score:", output[0][1].item(), ".\tPredicted class:", predicted.item())
+                outputs.append(output[0][1].item())
+                
+                start_index += shift
+                end_index += shift
+
+            return outputs
 
 
 model = KWS().to(device)
@@ -41,9 +70,17 @@ state_dict = torch.load(config.get('paths', 'path_to_weights_dict'))
 model.load_state_dict(state_dict)
 model = model.to(device)
 
-waveform, sample_rate = torchaudio.load(config.get('paths', 'path_to_audio'))
+mode = config.get('common', 'mode')
+if mode == 'example':
+    waveform = getBigWaveform()
+elif mode == 'check':
+    waveform, sample_rate = torchaudio.load(config.get('paths', 'path_to_audio'))
+
 spectrogram = mel_transform(waveform)
 spectrogram = torch.log(spectrogram + 1e-9)
 
-probabilities = apply(model, spectrogram)
-print(probabilities)
+print("device:", device)
+probabilities = apply(model, spectrogram, mode)
+
+# print("-------------------------------------------------------\n\
+# all scores:", probabilities)
